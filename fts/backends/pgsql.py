@@ -2,6 +2,7 @@
 
 from django.db import connection, transaction
 from django.db.models.fields import FieldDoesNotExist
+from django.db.models.query import QuerySet
 
 from fts.backends.base import InvalidFtsBackendError
 from fts.backends.base import BaseClass, BaseModel, BaseManager
@@ -47,6 +48,12 @@ class SearchManager(BaseManager):
         super(SearchManager, self).__init__(**kwargs)
         self.language = LANGUAGES[self.language_code]
         self._vector_field_cache = None
+
+    def _get_query_set(self):
+        qs = SearchQuerySet(self.model)
+        qs.vector_field = self.vector_field
+        qs.language = self.language
+        return qs
 
     def _vector_field(self):
         """
@@ -140,8 +147,10 @@ class SearchManager(BaseManager):
             self._update_index_walking(pk)
         else:
             self._update_index_update(pk)
-    
-    def _search(self, query, query_type='plain', **kwargs):
+
+
+class SearchQuerySet(QuerySet):
+    def search(self, query, query_type='plain', **kwargs):
         """
         Returns a queryset after having applied the full-text search query. If rank_field
         is specified, it is the name of the field that will be put on each returned instance.
@@ -153,21 +162,28 @@ class SearchManager(BaseManager):
         For possible rank_normalization values, refer to:
         http://www.postgresql.org/docs/8.3/static/textsearch-controls.html#TEXTSEARCH-RANKING
         """
-        rank_field = kwargs.get('rank_field')
+        rank_field = kwargs.get('rank_field', 'search_rank')
         rank_normalization = kwargs.get('rank_normalization', 32)
-        qs = self.get_query_set()
-        
+
         func_name = '%sto_tsquery' % (query_type if query_type else '')
         ts_query = "%s('%s', '%s')" % (func_name, self.language, query.replace("'", "''"))
         where = '%s.%s @@ %s' % (qn(self.model._meta.db_table), qn(self.vector_field.column), ts_query)
-        
+
         select = {}
         order = []
         if rank_field is not None:
-            select[rank_field] = 'ts_rank(%s.%s, %s, %d)' % (qn(self.model._meta.db_table), qn(self.vector_field.column), ts_query, rank_normalization)
+            select[rank_field] = 'ts_rank_cd(%s.%s, %s, %d)' % (qn(self.model._meta.db_table), qn(self.vector_field.column), ts_query, rank_normalization)
             order = ['-%s' % rank_field]
-        
-        return qs.extra(select=select, where=[where], order_by=order)
+
+        return self.extra(select=select, where=[where], order_by=order)
+
+    def _clone(self, *args, **kwargs):
+        """
+        Ensure attributes are copied to subsequent queries.
+        """
+        for attr in ("vector_field", "language"):
+            kwargs[attr] = getattr(self, attr)
+        return super(SearchQuerySet, self)._clone(*args, **kwargs)
 
 class SearchableModel(BaseModel):
     class Meta:

@@ -33,6 +33,15 @@ class BaseManager(models.Manager):
             return self # template variable resolver expects the object itself (no arguments)
         return self.search(query, **kwargs)
 
+    def get_query_set(self):
+        return self._get_query_set()
+
+    def _get_query_set(self):
+        raise NotImplementedError
+
+    def __getattr__(self, name):
+        return getattr(self.get_query_set(), name)
+
     def contribute_to_class(self, cls, name):
         # Instances need to get to us to update their indexes.
         search_managers = getattr(cls, '_search_managers', [])
@@ -42,7 +51,7 @@ class BaseManager(models.Manager):
 
         if not self.fields:
             self.fields = self._find_text_fields()
-        
+
         if isinstance(self.fields, (list, tuple)):
             self._fields = {}
             for field in self.fields:
@@ -52,9 +61,6 @@ class BaseManager(models.Manager):
     
     def _update_index(self, pk):
         raise NotImplementedError
-
-    def _search(self, query, **kwargs):
-        raise NotImplementedError
     
     @transaction.commit_on_success
     def update_index(self, pk=None):
@@ -62,9 +68,6 @@ class BaseManager(models.Manager):
         Updates the full-text index for one, many, or all instances of this manager's model.
         """
         return self._update_index(pk)
-    
-    def search(self, query, **kwargs):
-        return self._search(query, **kwargs)
     
     def _find_text_fields(self):
         """
