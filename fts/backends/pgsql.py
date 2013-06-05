@@ -1,8 +1,10 @@
 "Pgsql Fts backend"
 
-from django.db import connection, transaction
+from django.db import connection, transaction, connections
 from django.db.models.fields import FieldDoesNotExist
 from django.db.models.query import QuerySet
+from django.db.models.sql.query import Query
+from django.db.models.sql.compiler import SQLCompiler
 
 from fts.backends.base import InvalidFtsBackendError
 from fts.backends.base import BaseClass, BaseModel, BaseManager
@@ -38,6 +40,11 @@ class VectorField(models.Field):
     
     def db_type(self, connection=None):
         return 'tsvector'
+
+    def contribute_to_class(self, cls, name):
+        name = getattr(cls, 'search_vector_field', name)
+        self.db_column = name
+        super(VectorField, self).contribute_to_class(cls, name)
 
 class SearchClass(BaseClass):
     def __init__(self, server, params):
@@ -150,6 +157,66 @@ class SearchManager(BaseManager):
 
 
 class SearchQuerySet(QuerySet):
+
+    class SearchQuery(Query):
+
+        class SearchCompiler(SQLCompiler):
+            def get_from_clause(self):
+                from_, f_params = super(SearchQuerySet.SearchQuery.SearchCompiler, self).get_from_clause()
+                if hasattr(self.query, "ts_query"):
+                    ts_query = ", %s('%s', %%s) as ts_query" % (
+                        self.query.ts_function,
+                        self.query.ts_language)
+                    from_.append(ts_query)
+                    f_params.append(self.query.ts_query)
+                return from_, f_params
+
+        def get_compiler(self, using=None, connection=None):
+            """ Overrides the Query method get_compiler in order to return
+                an instance of the above custom compiler.
+            """
+            # Copy the body of this method from Django except the final
+            # return statement. We will ignore code coverage for this.
+            if using is None and connection is None: #pragma: no cover
+                raise ValueError("Need either using or connection")
+            if using:
+                connection = connections[using]
+                # Check that the compiler will be able to execute the query
+            for alias, aggregate in self.aggregate_select.items():
+                connection.ops.check_aggregate_support(aggregate)
+                # Instantiate the custom compiler.
+            return self.SearchCompiler(self, connection, using)
+
+        def clone(self, klass=None, memo=None, **kwargs):
+            _clone = super(SearchQuerySet.SearchQuery, self).clone(klass, memo, **kwargs)
+            if hasattr(self, "ts_language"):
+                _clone.ts_language = self.ts_language
+            if hasattr(self, "ts_function"):
+                _clone.ts_function = self.ts_function
+            if hasattr(self, "ts_query"):
+                _clone.ts_query = self.ts_query
+            return _clone
+
+    def __init__(self, model=None, query=None, using=None):
+        if query is None:
+            query = self.SearchQuery(model)
+        super(SearchQuerySet, self).__init__(model=model, query=query, using=using)
+
+    class SearchWhere(object):
+        def __init__(self, alias, column, query):
+            self.alias = alias
+            self.column = column
+            self.query = query
+
+        def as_sql(self, qn=None, connection=None):
+            sql = '%s.%s @@ %s' % (qn(self.alias), qn(self.column), self.query)
+            return (sql, [])
+
+        def relabel_aliases(self, change_map):
+            if self.alias in change_map:
+                self.alias = change_map[self.alias]
+
+
     def search(self, query, query_type='plain', **kwargs):
         """
         Returns a queryset after having applied the full-text search query. If rank_field
@@ -162,11 +229,11 @@ class SearchQuerySet(QuerySet):
         For possible rank_normalization values, refer to:
         http://www.postgresql.org/docs/8.3/static/textsearch-controls.html#TEXTSEARCH-RANKING
         """
-        rank_field = kwargs.get('rank_field', 'search_rank')
-        rank_normalization = kwargs.get('rank_normalization', 32)
+        rank_field = kwargs.get("rank_field", "search_rank")
+        rank_normalization = kwargs.get("rank_normalization", 32)
 
-        func_name = '%sto_tsquery' % (query_type if query_type else '')
-        ts_query = "%s('%s', '%s')" % (func_name, self.language, query.replace("'", "''"))
+        func_name = "%sto_tsquery" % (query_type if query_type else '')
+        ts_query = "ts_query"
         where = '%s.%s @@ %s' % (qn(self.model._meta.db_table), qn(self.vector_field.column), ts_query)
 
         select = {}
@@ -175,7 +242,19 @@ class SearchQuerySet(QuerySet):
             select[rank_field] = 'ts_rank_cd(%s.%s, %s, %d)' % (qn(self.model._meta.db_table), qn(self.vector_field.column), ts_query, rank_normalization)
             order = ['-%s' % rank_field]
 
-        return self.extra(select=select, where=[where], order_by=order)
+        # return self.extra(select=select, where=[where], order_by=order)
+        #
+        clone = self.extra(select=select, order_by=order)
+
+        where = SearchQuerySet.SearchWhere(self.model._meta.db_table,
+                                           self.vector_field.column,
+                                           ts_query)
+        clone.query.where.add(where, "AND")
+        clone.query.ts_language = self.language
+        clone.query.ts_function = func_name
+        clone.query.ts_query = query
+        return clone
+
 
     def _clone(self, *args, **kwargs):
         """
