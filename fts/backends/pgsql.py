@@ -234,24 +234,23 @@ class SearchQuerySet(QuerySet):
         rank_normalization = kwargs.get("rank_normalization", 32)
 
         func_name = "%sto_tsquery" % (query_type if query_type else '')
-        ts_query = "(%(fn)s(%%s, %%s) || %(fn)s('english_broad', %%s))" % {"fn": func_name}
+        ts_query = "%s(%%s, %%s)" % func_name
         where = '%s.%s @@ %s' % (qn(self.model._meta.db_table), qn(self.vector_field.column), ts_query)
 
         select = {}
         order = []
         if rank_field is not None:
-            select[rank_field] = 'ts_rank_cd(%s.%s, %s, %d) * ((4+starred::integer)::numeric/5) * ((LEAST(2, "STOCK_QTY" + "ORDER_QTY") + 4) / 5)' % (qn(self.model._meta.db_table), qn(self.vector_field.column), ts_query, rank_normalization)
+            select[rank_field] = 'ts_rank_cd(%s.%s, %s, %d)' % (qn(self.model._meta.db_table), qn(self.vector_field.column), ts_query, rank_normalization)
             order = ['-%s' % rank_field]
 
         # return self.extra(select=select, where=[where], order_by=order)
         #
-        clone = self.extra(select=select, order_by=order, select_params=[self.language, query, query])
+        clone = self.extra(select=select, order_by=order, select_params=[self.language, query])
 
         where = SearchQuerySet.SearchWhere(self.model._meta.db_table,
                                            self.vector_field.column,
                                            ts_query,
                                            self.language,
-                                           query,
                                            query)
         clone.query.where.add(where, "AND")
         clone.query.ts_language = self.language
